@@ -1,0 +1,21 @@
+{
+    "schema_version": "1.0",
+    "description": "Schema for a single CMS flat-file column FHIR mapping record",
+    "required": ["column_name", "dataset", "fhir_resource", "fhir_element_path", 
+                 "cms_0057f_api", "us_core_validated", "gap_type"],
+    "properties": {
+        "column_name": {"type": "string"},
+        "dataset": {"type": "string", "example": "mssp_puf"},
+        "description": {"type": "string"},
+        "fhir_resource": {"type": "string", "example": "ExplanationOfBenefit"},
+        "fhir_element_path": {"type": "string", "example": ".total.amount.value"},
+        "cms_0057f_api": {"type": "string", 
+                         "enum": ["Patient Access","Provider Access","Prior Auth",
+                                  "Payer-to-Payer","Provider Directory","N/A"]},
+        "us_core_validated": {"type": "string", "enum": ["yes","partial","no","gap"]},
+        "gap_type": {"type": ["string","null"], 
+                    "enum": [null,"no_equivalent","partial_mapping",
+                             "custom_extension_required","aggregation_gap"]},
+        "gap_notes": {"type": "string"}
+    }
+}

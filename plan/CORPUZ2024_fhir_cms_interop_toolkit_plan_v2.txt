@@ -1,0 +1,881 @@
+CORPUZ-2024
+
+fhir-cms-interop-toolkit
+
+FHIR Interoperability Portfolio Project — Project Plan v2
+
+April 2026 | Nicole Corpuz | v2: Claude Code-executable technical specs added to all 4 modules
+
+GitHub repo: fhir-cms-interop-toolkit
+Primary audience   Health IT engineers, interoperability analysts, CMS-0057-F compliance teams
+
+Modules: 4: PA compliance checker, FHIR field mapper, BB2 sandbox queries, PUF gap analysis   v2 change
+Each module now includes: exact file tree, function signatures, I/O contracts, schemas, test commands, error handling, and acceptance criteria
+
+========================================================================
+00 Repository setup — run before any module
+
+Clone or init the repo, then run these commands exactly. Claude Code should execute this block first.
+
+# Init repo
+git clone https://github.com/YOUR_USERNAME/fhir-cms-interop-toolkit.git
+cd fhir-cms-interop-toolkit
+# Create full directory tree
+mkdir -p modules/pa_compliance_checker/data/payer_disclosures
+mkdir -p modules/fhir_field_mapper/data/mappings
+mkdir -p modules/bb2_sandbox/data
+mkdir -p modules/puf_fhir_gap_analysis/output
+mkdir -p data/synthea_puf
+mkdir -p docs
+# Install all dependencies
+pip install requests pdfplumber beautifulsoup4 pandas openpyxl \
+fhir.resources python-dotenv pytest notebook ipykernel
+# Create .env (NEVER commit this)
+echo 'BB2_CLIENT_ID=your_id_here' >> .env
+echo 'BB2_CLIENT_SECRET=your_secret_here' >> .env
+echo 'BB2_CALLBACK_URL=http://localhost:8000/callback' >> .env
+# Create .gitignore
+echo '.env\n__pycache__/\n*.pyc\n.ipynb_checkpoints/\ndata/synthea_puf/' > .gitignore
+
+# Validate setup
+python3 -c "import requests, pdfplumber, bs4, pandas, fhir; print('OK')"
+# Expected output: OK
+
+========================================================================
+Module 1 — CMS-0057-F PA Metrics Compliance Checker
+
+Path: modules/pa_compliance_checker/ | Run: pytest modules/pa_compliance_checker/tests/
+
+Fetches publicly posted payer PA metrics disclosures (PDF or HTML), extracts the 7 CMS-required metric fields, validates the math and schema, and outputs a compliance report table. Real payer disclosures went live March 31, 2026.
+
+1.1 File tree
+
+modules/pa_compliance_checker/
+├── pa_disclosure_scraper.py # fetch + save payer disclosure pages
+├── pa_field_extractor.py # extract 7 fields from PDF or HTML
+├── pa_compliance_validator.py # validate schema + math
+├── pa_report_generator.py # render Markdown compliance table
+├── run_all.py # end-to-end pipeline entry point
+├── tests/
+│ ├── test_extractor.py
+│ └── test_validator.py
+└── data/payer_disclosures/
+├── molina_ca_2025.pdf # archived snapshots
+├── lacare_2025.html
+├── caloptima_2025.pdf
+├── bsca_promise_2025.pdf
+└── README.md # source URLs + retrieval date
+
+1.2 pa_disclosure_scraper.py
+
+Purpose
+
+Fetches payer PA metrics disclosure pages and saves them locally for reproducible analysis.
+
+# pa_disclosure_scraper.py
+import requests, os, time
+from pathlib import Path
+PAYERS = {
+'molina_ca': 'https://www.molinahealthcare.com/providers/ca/medicaid/prior-auth/metrics',
+'lacare': 'https://www.lacare.org/providers/prior-authorization/metrics',
+'caloptima': 'https://www.caloptima.org/prior-auth-metrics',
+'bsca': 'https://www.blueshieldca.com/providers/prior-auth-metrics',
+}
+SAVE_DIR = Path('modules/pa_compliance_checker/data/payer_disclosures')
+def fetch_disclosure(payer_key: str, url: str) -> Path:
+"""
+Fetch a payer disclosure page and save to disk.
+Returns: Path to saved file.
+Raises: requests.HTTPError on non-200 response.
+"""
+headers = {'User-Agent': 'Mozilla/5.0 (research/compliance-checker)'}
+r = requests.get(url, headers=headers, timeout=30)
+r.raise_for_status()
+ext = '.pdf' if 'pdf' in r.headers.get('Content-Type','') else '.html'
+out = SAVE_DIR / f'{payer_key}_2025{ext}'
+out.write_bytes(r.content)
+print(f'Saved {payer_key}: {len(r.content):,} bytes -> {out}')
+return out
+def fetch_all(delay_sec: float = 1.5) -> dict[str, Path]:
+"""Fetch all payers. Returns {payer_key: Path}. Skips if file exists."""
+results = {}
+for key, url in PAYERS.items():
+existing = list(SAVE_DIR.glob(f'{key}_2025.*'))
+if existing:
+print(f'Skip {key}: already saved at {existing[0]}')
+results[key] = existing[0]
+continue
+results[key] = fetch_disclosure(key, url)
+time.sleep(delay_sec)
+return results
+# NOTE: If automated fetch fails (bot-blocking), manually download and
+# save to data/payer_disclosures/ with naming convention above.
+# Update data/payer_disclosures/README.md with source URL + retrieval date.
+
+Manual fallback
+If automated fetch returns 403 or 429 for any payer: download the PDF manually from the payer website, save to data/payer_disclosures/{payer_key}_2025.pdf, and update the README.md with the retrieval date. Reproducibility is the priority — the file just needs to exist on disk.
+
+1.3 pa_field_extractor.py
+
+Purpose
+
+Extracts the 7 CMS-required PA metric field values from a saved PDF or HTML disclosure. Returns a structured dict.
+
+# pa_field_extractor.py
+import pdfplumber, re
+from bs4 import BeautifulSoup
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+# The 7 required CMS-0057-F fields (source: CMS PA API FAQ)
+FIELD_KEYS = [
+'pa_required_list', # F1: list of PA-required items (not a rate)
+'standard_approved_pct', # F2: % standard requests approved
+'standard_denied_pct', # F3: % standard requests denied
+'approved_after_appeal_pct',# F4: % approved after appeal (denom = denied)
+'extended_review_approved_pct', # F5: % extended review then approved
+'expedited_approved_pct', # F6: % expedited approved
+'expedited_denied_pct', # F7: % expedited denied
+]
+@dataclass
+class PAMetricsRaw:
+payer_key: str
+source_path: str
+pa_required_list: Optional[str] = None # raw text list
+standard_approved_pct: Optional[float] = None
+standard_denied_pct: Optional[float] = None
+approved_after_appeal_pct: Optional[float] = None
+extended_review_approved_pct: Optional[float] = None
+expedited_approved_pct: Optional[float] = None
+expedited_denied_pct: Optional[float] = None
+extraction_notes: list = field(default_factory=list)
+RATE_PATTERNS = {
+'standard_approved_pct': [r'standard.*approv.*?(\d+\.?\d*)\s*%'],
+'standard_denied_pct': [r'standard.*deni.*?(\d+\.?\d*)\s*%'],
+'approved_after_appeal_pct': [r'appeal.*approv.*?(\d+\.?\d*)\s*%',
+r'overtur.*?(\d+\.?\d*)\s*%'],
+'extended_review_approved_pct': [r'extend.*review.*?(\d+\.?\d*)\s*%'],
+'expedited_approved_pct': [r'expedit.*approv.*?(\d+\.?\d*)\s*%'],
+'expedited_denied_pct': [r'expedit.*deni.*?(\d+\.?\d*)\s*%'],
+}
+def extract_text_from_pdf(path: Path) -> str:
+with pdfplumber.open(path) as pdf:
+return '\n'.join(page.extract_text() or '' for page in pdf.pages)
+def extract_text_from_html(path: Path) -> str:
+soup = BeautifulSoup(path.read_text(encoding='utf-8'), 'html.parser')
+return soup.get_text(separator=' ', strip=True)
+def extract_rate(text: str, field_key: str) -> Optional[float]:
+"""Try each regex pattern for a field. Return first match as float, or None."""
+for pattern in RATE_PATTERNS[field_key]:
+m = re.search(pattern, text, re.IGNORECASE: re.DOTALL)
+if m:
+return float(m.group(1))
+return None
+def extract(path: Path, payer_key: str) -> PAMetricsRaw:
+"""
+Extract all 7 PA metric fields from a PDF or HTML disclosure file.
+Input: Path to saved disclosure file, payer identifier string.
+Output: PAMetricsRaw dataclass. None values = field not found.
+"""
+text = extract_text_from_pdf(path) if path.suffix == '.pdf' else extract_text_from_html(path)
+result = PAMetricsRaw(payer_key=payer_key, source_path=str(path))
+for field_key in RATE_PATTERNS:
+val = extract_rate(text, field_key)
+setattr(result, field_key, val)
+if val is None:
+result.extraction_notes.append(f'{field_key}: not found via regex')
+# F1 is a list, not a rate — search for a structured list near 'prior authorization'
+f1_m = re.search(r'items?.{0,80}(services?: procedures?).{0,500}', text, re.IGNORECASE
+re.DOTALL)
+result.pa_required_list = f1_m.group(0)[:400].strip() if f1_m else None
+return result
+
+1.4 pa_compliance_validator.py
+
+Purpose
+
+Validates extracted field values against CMS-0057-F schema rules. Returns a list of ValidationResult objects.
+
+# pa_compliance_validator.py
+from dataclasses import dataclass
+from pa_field_extractor import PAMetricsRaw
+from typing import Optional
+@dataclass
+class ValidationResult:
+payer_key: str
+field: str
+reported_value: Optional[float]
+expected: str
+status: str # 'PASS': 'FAIL'
+'WARN': 'MISSING'
+note: str = ''
+def validate(raw: PAMetricsRaw) -> list[ValidationResult]:
+"""
+Apply all CMS-0057-F validation rules to a PAMetricsRaw record.
+Returns: list of ValidationResult, one per check.
+"""
+results = []
+pk = raw.payer_key
+def check(field, value, expected_str, pass_fn, note=''):
+if value is None:
+results.append(ValidationResult(pk, field, None, expected_str, 'MISSING', 'Field not found in disclosure'))
+return
+status = 'PASS' if pass_fn(value) else 'FAIL'
+results.append(ValidationResult(pk, field, value, expected_str, status, note))
+# Rule 1: All rate fields must be 0–100
+rate_fields = ['standard_approved_pct','standard_denied_pct','approved_after_appeal_pct',
+'extended_review_approved_pct','expedited_approved_pct','expedited_denied_pct']
+for f in rate_fields:
+v = getattr(raw, f)
+check(f, v, '0–100 numeric', lambda x: 0 <= x <= 100)
+# Rule 2: F2 + F3 must sum to 100 (±0.5 tolerance for rounding)
+if raw.standard_approved_pct is not None and raw.standard_denied_pct is not None:
+s = raw.standard_approved_pct + raw.standard_denied_pct
+results.append(ValidationResult(pk, 'F2+F3 sum', s, '100 ±0.5',
+'PASS' if abs(s - 100) <= 0.5 else 'FAIL',
+f'F2={raw.standard_approved_pct} + F3={raw.standard_denied_pct} = {s:.1f}'))
+# Rule 3: F6 + F7 must sum to 100 (±0.5 tolerance)
+if raw.expedited_approved_pct is not None and raw.expedited_denied_pct is not None:
+s = raw.expedited_approved_pct + raw.expedited_denied_pct
+results.append(ValidationResult(pk, 'F6+F7 sum', s, '100 ±0.5',
+'PASS' if abs(s - 100) <= 0.5 else 'FAIL',
+f'F6={raw.expedited_approved_pct} + F7={raw.expedited_denied_pct} = {s:.1f}'))
+# Rule 4: F4 denominator flag — we cannot verify denominator from the disclosure
+# alone, but we can flag if F4 > 90% (implausibly high overturn rate,
+# likely computed against total requests not total denials)
+if raw.approved_after_appeal_pct is not None:
+results.append(ValidationResult(pk, 'F4 denominator flag', raw.approved_after_appeal_pct,
+'<90% (implausibility threshold)',
+'WARN' if raw.approved_after_appeal_pct > 90 else 'PASS',
+'Value >90% suggests denominator may be total PA requests, not total denials (~12x error)'))
+# Rule 5: F1 must be present
+results.append(ValidationResult(pk, 'F1 pa_required_list', None,
+'Non-empty text list', 'PASS' if raw.pa_required_list else 'MISSING'))
+return results
+
+1.5 pa_report_generator.py + run_all.py
+
+# pa_report_generator.py
+import pandas as pd
+from pa_compliance_validator import ValidationResult
+STATUS_EMOJI = {'PASS': 'OK', 'FAIL': 'FAIL', 'WARN': 'WARN', 'MISSING': 'MISS'}
+def to_markdown_table(results: list[ValidationResult]) -> str:
+"""Render validation results as a GitHub-renderable Markdown table."""
+rows = [{'Payer': r.payer_key, 'Field': r.field, 'Value': r.reported_value,
+'Expected': r.expected, 'Status': STATUS_EMOJI[r.status], 'Note': r.note}
+for r in results]
+return pd.DataFrame(rows).to_markdown(index=False)
+def save_report(results: list[ValidationResult], out_path: str = 'output/compliance_report.md'):
+md = '# CMS-0057-F PA Metrics Compliance Report\n\n' + to_markdown_table(results)
+open(out_path, 'w').write(md)
+print(f'Report saved: {out_path}')
+
+# run_all.py — end-to-end pipeline entry point
+from pa_disclosure_scraper import fetch_all
+from pa_field_extractor import extract
+from pa_compliance_validator import validate
+from pa_report_generator import save_report
+def main():
+files = fetch_all() # Step 1: fetch/load disclosures
+all_results = []
+for payer_key, path in files.items():
+raw = extract(path, payer_key) # Step 2: extract 7 fields
+results = validate(raw) # Step 3: validate
+all_results.extend(results)
+print(f'{payer_key}: {sum(r.status=="FAIL" for r in results)} FAIL, '
+f'{sum(r.status=="MISSING" for r in results)} MISSING')
+save_report(all_results) # Step 4: output Markdown table
+if __name__ == '__main__': main()
+
+1.6 Tests
+
+# tests/test_validator.py
+from pa_field_extractor import PAMetricsRaw
+from pa_compliance_validator import validate
+def make_raw(f2=92.3, f3=7.7, f4=61.2, f5=3.1, f6=89.1, f7=10.9):
+return PAMetricsRaw(
+payer_key='test', source_path='test.pdf',
+pa_required_list='DME, home health, inpatient, SNF',
+standard_approved_pct=f2, standard_denied_pct=f3,
+approved_after_appeal_pct=f4, extended_review_approved_pct=f5,
+expedited_approved_pct=f6, expedited_denied_pct=f7)
+def test_f2_f3_sum_pass(): assert all(r.status=='PASS' for r in validate(make_raw()) if r.field=='F2+F3 sum')
+def test_f2_f3_sum_fail(): assert any(r.status=='FAIL' for r in validate(make_raw(f2=90,f3=5)) if r.field=='F2+F3 sum')
+def test_f4_denominator_warn(): assert any(r.status=='WARN' for r in validate(make_raw(f4=95)) if 'denominator' in r.field)
+def test_missing_field(): assert any(r.status=='MISSING' for r in validate(make_raw(f2=None)) if 'standard_approved' in r.field)
+# Run: pytest modules/pa_compliance_checker/tests/ -v
+
+Acceptance criteria — Module 1 is done when
+(1) run_all.py produces output/compliance_report.md with all 4+ payers. (2) All PASS/FAIL/WARN/MISSING cells are populated. (3) pytest passes with 0 failures. (4) Report renders correctly as a Markdown table in the GitHub repo preview.
+
+========================================================================
+Module 2 — FHIR R4 Field Mapping Library
+
+Path: modules/fhir_field_mapper/ | Run: pytest modules/fhir_field_mapper/tests/
+
+A reusable Python library that maps any CMS flat-file column name to its FHIR R4 resource, element path, CMS-0057-F API exposure, and gap type. Built as a class with a queryable registry — not a one-off table.
+
+2.1 File tree
+
+modules/fhir_field_mapper/
+├── fhir_mapper.py # FHIRMapper class — core library
+├── cms_flat_file_registry.py # column registry per CMS dataset
+├── us_core_validator.py # StructureDefinition path checker
+├── fhir_mapping_notebook.ipynb # interactive demo
+├── tests/
+│ └── test_fhir_mapper.py
+└── data/mappings/
+├── mssp_puf.json # MSSP PUF column mappings
+└── schema.json # mapping record schema definition
+
+2.2 data/mappings/schema.json — define this first
+
+{
+"schema_version": "1.0",
+"description": "Schema for a single CMS flat-file column FHIR mapping record",
+"required": ["column_name", "dataset", "fhir_resource", "fhir_element_path",
+"cms_0057f_api", "us_core_validated", "gap_type"],
+"properties": {
+"column_name": {"type": "string"},
+"dataset": {"type": "string", "example": "mssp_puf"},
+"description": {"type": "string"},
+"fhir_resource": {"type": "string", "example": "ExplanationOfBenefit"},
+"fhir_element_path": {"type": "string", "example": ".total.amount.value"},
+"cms_0057f_api": {"type": "string",
+"enum": ["Patient Access","Provider Access","Prior Auth",
+"Payer-to-Payer","Provider Directory","N/A"]},
+"us_core_validated": {"type": "string", "enum": ["yes","partial","no","gap"]},
+"gap_type": {"type": ["string","null"],
+"enum": [null,"no_equivalent","partial_mapping",
+"custom_extension_required","aggregation_gap"]},
+"gap_notes": {"type": "string"}
+}
+}
+
+2.3 data/mappings/mssp_puf.json — all 8 MSSP PUF fields
+
+[
+{"column_name":"avg_risk_score", "dataset":"mssp_puf",
+"description":"County-level average CMS-HCC risk score by enrollment type",
+"fhir_resource":"RiskAssessment",
+"fhir_element_path":".prediction.probabilityDecimal",
+"cms_0057f_api":"Provider Access", "us_core_validated":"yes", "gap_type":null,
+"gap_notes":""},
+{"column_name":"total_per_capita_exp", "dataset":"mssp_puf",
+"description":"County-level aggregate per-capita expenditure",
+"fhir_resource":"ExplanationOfBenefit",
+"fhir_element_path":".total.amount.value",
+"cms_0057f_api":"Patient Access", "us_core_validated":"yes", "gap_type":null,
+"gap_notes":"Population aggregate -- EOB is per-claim, aggregation done in preprocessing"},
+{"column_name":"n_ab_ben", "dataset":"mssp_puf",
+"description":"Number of assignable beneficiaries",
+"fhir_resource":"Group", "fhir_element_path":".member.count",
+"cms_0057f_api":"Provider Access", "us_core_validated":"partial",
+"gap_type":"custom_extension_required",
+"gap_notes":"US Core Group has no standard enrollment count. BB2 returns Group.member list -- compute len() in preprocessing"},
+{"column_name":"aco_state", "dataset":"mssp_puf",
+"description":"State of ACO operation",
+"fhir_resource":"Organization", "fhir_element_path":".address.state",
+"cms_0057f_api":"Provider Directory", "us_core_validated":"yes", "gap_type":null, "gap_notes":""},
+{"column_name":"quality_score", "dataset":"mssp_puf",
+"description":"MSSP quality composite score",
+"fhir_resource":"MeasureReport", "fhir_element_path":".group.measureScore",
+"cms_0057f_api":"Patient Access", "us_core_validated":"no",
+"gap_type":"custom_extension_required",
+"gap_notes":"HEDIS/CAHPS composite requires custom MeasureReport profile. Standard BB2 returns null for this field"},
+{"column_name":"sav_rate", "dataset":"mssp_puf",
+"description":"ACO shared savings / loss rate",
+"fhir_resource":null, "fhir_element_path":null,
+"cms_0057f_api":"N/A", "us_core_validated":"gap",
+"gap_type":"no_equivalent",
+"gap_notes":"STRUCTURAL GAP: no FHIR R4 resource for financial performance metrics. Cannot be expressed through any CMS-0057-F API without a new resource type"},
+{"column_name":"enrollment_type", "dataset":"mssp_puf",
+"description":"MSSP enrollment type (ESRD/Disabled/Aged Dual/Aged Non-Dual)",
+"fhir_resource":"Coverage", "fhir_element_path":".type.coding.code",
+"cms_0057f_api":"Patient Access", "us_core_validated":"partial",
+"gap_type":"custom_extension_required",
+"gap_notes":"US Core Coverage.type value set does not include MSSP enrollment types. CMS-specific extension required"},
+{"column_name":"per_capita_exp_by_enrollment_type", "dataset":"mssp_puf",
+"description":"Per-capita expenditure stratified by enrollment type",
+"fhir_resource":"ExplanationOfBenefit", "fhir_element_path":".total.amount (+ Coverage filter)",
+"cms_0057f_api":"Patient Access", "us_core_validated":"no",
+"gap_type":"aggregation_gap",
+"gap_notes":"Requires joining EOB to Coverage on patient ID then filtering by coverage type. Population-level aggregation not native to FHIR"}
+]
+
+2.4 fhir_mapper.py — FHIRMapper class
+
+# fhir_mapper.py
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
+MAPPINGS_DIR = Path('modules/fhir_field_mapper/data/mappings')
+@dataclass
+class MappingResult:
+column_name: str
+dataset: str
+fhir_resource: Optional[str]
+fhir_element_path: Optional[str]
+cms_0057f_api: str
+us_core_validated: str # 'yes': 'partial'
+'no': 'gap'
+gap_type: Optional[str] # null: 'no_equivalent'
+'partial_mapping'
+#: 'custom_extension_required'
+'aggregation_gap'
+gap_notes: str
+class FHIRMapper:
+"""
+Maps CMS flat-file column names to FHIR R4 equivalents.
+Usage:
+mapper = FHIRMapper()
+result = mapper.map('avg_risk_score') # single lookup
+df = mapper.map_all('mssp_puf') # all columns for a dataset
+gaps = mapper.get_gaps(gap_type='no_equivalent') # filter by gap type
+"""
+def __init__(self):
+self._registry: dict[str, dict] = {} # {column_name: record}
+self._load_all()
+def _load_all(self):
+"""Load all JSON mapping files from data/mappings/."""
+for f in MAPPINGS_DIR.glob('*.json'):
+if f.stem == 'schema': continue
+records = json.loads(f.read_text())
+for rec in records:
+self._registry[rec['column_name']] = rec
+print(f'FHIRMapper: loaded {len(self._registry)} column mappings')
+def map(self, column_name: str) -> MappingResult:
+"""
+Look up a single column name.
+Input: column_name (str) — exact match to column_name field in JSON.
+Output: MappingResult dataclass.
+Raises: KeyError if column not in registry.
+"""
+if column_name not in self._registry:
+raise KeyError(f"Column '{column_name}' not in registry. ",
+f"Available: {list(self._registry.keys())}")
+r = self._registry[column_name]
+return MappingResult(**{k: r.get(k) for k in MappingResult.__dataclass_fields__})
+def map_all(self, dataset: str = None) -> list[MappingResult]:
+"""Return all mappings, optionally filtered by dataset name."""
+records = self._registry.values()
+if dataset:
+records = [r for r in records if r['dataset'] == dataset]
+return [MappingResult(**{k: r.get(k) for k in MappingResult.__dataclass_fields__})
+for r in records]
+def get_gaps(self, gap_type: str = None) -> list[MappingResult]:
+"""Return all fields with a gap_type, optionally filtered by type."""
+return [r for r in self.map_all()
+if r.gap_type and (gap_type is None or r.gap_type == gap_type)]
+def summary(self) -> dict:
+"""Return counts by gap_type for quick overview."""
+from collections import Counter
+return dict(Counter(r.gap_type or 'no_gap' for r in self.map_all()))
+
+2.5 us_core_validator.py
+
+# us_core_validator.py
+# Checks whether a FHIR element path exists in the US Core IG v7 StructureDefinition
+import requests, json
+US_CORE_BASE = 'https://hl7.org/fhir/us/core/STU7/StructureDefinition-'
+def check_element_path(resource: str, element_path: str) -> dict:
+"""
+Query US Core IG StructureDefinition for a resource and check if
+the given element path exists.
+Input: resource (str) e.g. 'ExplanationOfBenefit'
+element_path (str) e.g. '.total.amount.value'
+Output: dict with keys: resource, element_path, found (bool), note (str)
+"""
+url = f'{US_CORE_BASE}us-core-{resource.lower()}.json'
+try:
+r = requests.get(url, timeout=15)
+if r.status_code == 404:
+return {'resource': resource, 'element_path': element_path,
+'found': False, 'note': f'No US Core profile for {resource}'}
+sd = r.json()
+# Element paths in StructureDefinition are in snapshot.element[].path
+elements = [e['path'] for e in sd.get('snapshot', {}).get('element', [])]
+clean_path = resource + element_path # e.g. 'ExplanationOfBenefit.total.amount.value'
+found = any(e == clean_path or e.startswith(clean_path) for e in elements)
+return {'resource': resource, 'element_path': element_path,
+'found': found, 'note': '' if found else 'Path not in US Core snapshot'}
+except Exception as ex:
+return {'resource': resource, 'element_path': element_path,
+'found': False, 'note': str(ex)}
+
+2.6 Tests
+
+# tests/test_fhir_mapper.py
+from fhir_mapper import FHIRMapper
+mapper = FHIRMapper()
+def test_known_column(): assert mapper.map('avg_risk_score').fhir_resource == 'RiskAssessment'
+def test_structural_gap(): assert mapper.map('sav_rate').gap_type == 'no_equivalent'
+def test_no_gap(): assert mapper.map('avg_risk_score').gap_type is None
+def test_unknown_raises():
+import pytest
+with pytest.raises(KeyError): mapper.map('nonexistent_column')
+def test_map_all_mssp(): assert len(mapper.map_all('mssp_puf')) == 8
+def test_get_gaps_filter():
+gaps = mapper.get_gaps('no_equivalent')
+assert any(g.column_name == 'sav_rate' for g in gaps)
+def test_summary_has_no_equivalent(): assert mapper.summary().get('no_equivalent', 0) >= 1
+
+Acceptance criteria — Module 2 is done when
+(1) FHIRMapper().map('sav_rate') returns gap_type='no_equivalent'. (2) FHIRMapper().summary() prints a dict with counts for each gap type. (3) All 8 MSSP PUF columns are in the registry. (4) pytest passes. (5) fhir_mapping_notebook.ipynb runs end-to-end with FHIRMapper().map_all('mssp_puf') producing a Pandas DataFrame.
+
+========================================================================
+Module 3 — CMS Blue Button 2.0 Sandbox Query Notebook
+
+Path: modules/bb2_sandbox/ | Prereq: BB2 sandbox credentials in .env
+
+Authenticates against CMS BB2 sandbox via SMART on FHIR OAuth2, queries Patient, ExplanationOfBenefit, and Coverage resources, and compares field values to FHIRMapper expected mappings from Module 2.
+
+3.1 File tree
+
+modules/bb2_sandbox/
+├── bb2_auth.py # SMART on FHIR OAuth2 authorization code flow
+├── bb2_queries.py # FHIR resource query functions with pagination
+├── fhir_response_parser.py # flatten FHIR Bundle -> dict matching MappingResult schema
+├── bb2_sandbox_notebook.ipynb # end-to-end: auth -> query -> compare -> table
+├── README_bb2.md # registration guide + troubleshooting
+└── data/
+└── bb2_responses/ # cached raw API responses (JSON) for reproducibility
+└── .gitkeep
+
+3.2 BB2 sandbox registration — do this first
+
+# 1. Go to: https://bluebutton.cms.gov/developers/
+# 2. Click 'Sign up for sandbox access'
+# 3. Register a new application:
+# - Name: fhir-cms-interop-toolkit
+# - Redirect URI: http://localhost:8000/callback
+# - Scopes: patient/Patient.read patient/ExplanationOfBenefit.read patient/Coverage.read
+# 4. Save BB2_CLIENT_ID and BB2_CLIENT_SECRET to your .env file
+#
+# API endpoints (sandbox):
+# Auth: https://sandbox.bluebutton.cms.gov/o/authorize/
+# Token: https://sandbox.bluebutton.cms.gov/o/token/
+# FHIR base: https://sandbox.bluebutton.cms.gov/v2/fhir/
+
+3.3 bb2_auth.py
+
+# bb2_auth.py — SMART on FHIR OAuth2 authorization code flow
+import os, webbrowser, json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlencode, urlparse, parse_qs
+import requests
+from dotenv import load_dotenv
+from pathlib import Path
+load_dotenv()
+CLIENT_ID = os.environ['BB2_CLIENT_ID']
+CLIENT_SECRET = os.environ['BB2_CLIENT_SECRET']
+CALLBACK_URL = os.environ.get('BB2_CALLBACK_URL', 'http://localhost:8000/callback')
+AUTH_URL = 'https://sandbox.bluebutton.cms.gov/o/authorize/'
+TOKEN_URL = 'https://sandbox.bluebutton.cms.gov/o/token/'
+TOKEN_CACHE = Path('modules/bb2_sandbox/data/.token_cache.json')
+_auth_code = None # captured by local HTTP callback server
+class CallbackHandler(BaseHTTPRequestHandler):
+def do_GET(self):
+global _auth_code
+params = parse_qs(urlparse(self.path).query)
+_auth_code = params.get('code', [None])[0]
+self.send_response(200)
+self.end_headers()
+self.wfile.write(b'Auth code captured. Return to terminal.')
+def log_message(self, *args): pass # suppress server logs
+def get_auth_code() -> str:
+"""Open browser for user login, capture auth code via local callback server."""
+global _auth_code
+params = urlencode({'client_id': CLIENT_ID, 'response_type': 'code',
+'redirect_uri': CALLBACK_URL,
+'scope': 'patient/Patient.read patient/ExplanationOfBenefit.read patient/Coverage.read'})
+webbrowser.open(f'{AUTH_URL}?{params}')
+server = HTTPServer(('localhost', 8000), CallbackHandler)
+print('Waiting for auth callback on http://localhost:8000 ...')
+server.handle_request() # blocks until one request arrives
+if not _auth_code: raise RuntimeError('No auth code received')
+return _auth_code
+def exchange_code(code: str) -> dict:
+"""Exchange auth code for access token. Returns token dict with access_token."""
+r = requests.post(TOKEN_URL, data={
+'grant_type': 'authorization_code', 'code': code,
+'redirect_uri': CALLBACK_URL,
+'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET})
+r.raise_for_status()
+token = r.json()
+TOKEN_CACHE.write_text(json.dumps(token))
+return token
+def get_token() -> str:
+"""
+Return a valid access_token string. Uses cached token if present.
+Full auth flow runs in browser if no cache exists.
+Output: access_token (str)
+"""
+if TOKEN_CACHE.exists():
+token = json.loads(TOKEN_CACHE.read_text())
+# BB2 sandbox tokens last 1 hour; attempt refresh if refresh_token present
+if 'access_token' in token: return token['access_token']
+code = get_auth_code()
+token = exchange_code(code)
+return token['access_token']
+# Common OAuth2 errors and causes:
+# invalid_client -> CLIENT_ID or CLIENT_SECRET wrong in .env
+# redirect_uri_mismatch -> CALLBACK_URL in .env doesn't match registration
+# insufficient_scope -> add scope to registration on BB2 developer portal
+# 403 on API call -> token expired; delete .token_cache.json and re-auth
+
+3.4 bb2_queries.py
+
+# bb2_queries.py — FHIR resource query functions
+import requests, json
+from pathlib import Path
+FHIR_BASE = 'https://sandbox.bluebutton.cms.gov/v2/fhir'
+CACHE_DIR = Path('modules/bb2_sandbox/data/bb2_responses')
+def _get(path: str, token: str, params: dict = None) -> dict:
+"""Single authenticated FHIR GET. Raises on non-200."""
+r = requests.get(f'{FHIR_BASE}{path}', params=params,
+headers={'Authorization': f'Bearer {token}',
+'Accept': 'application/fhir+json'})
+if r.status_code == 403: raise PermissionError('Token expired or wrong scope -- re-auth')
+if r.status_code == 400: raise ValueError(f'Bad request: {r.text[:200]}')
+r.raise_for_status()
+return r.json()
+def get_patient(token: str) -> dict:
+"""
+Query the Patient resource for the authenticated synthetic beneficiary.
+Output: FHIR Patient resource dict.
+Key fields: id (bene_id), name, birthDate, gender.
+"""
+result = _get('/Patient', token)
+_cache(result, 'patient')
+return result
+def get_eob(token: str, count: int = 50) -> list[dict]:
+"""
+Query all ExplanationOfBenefit resources for the authenticated beneficiary.
+Handles Bundle pagination via Bundle.link[relation='next'].
+Input: count — page size (default 50, max 50 per BB2 docs).
+Output: list of EOB resource dicts (unpacked from Bundle).
+"""
+results = []
+data = _get('/ExplanationOfBenefit', token, {'_count': count})
+while True:
+results.extend(e['resource'] for e in data.get('entry', []))
+next_url = next((l['url'] for l in data.get('link',[]) if l['relation']=='next'), None)
+if not next_url: break
+r = requests.get(next_url, headers={'Authorization': f'Bearer {token}',
+'Accept': 'application/fhir+json'})
+r.raise_for_status()
+data = r.json()
+_cache({'resourceType': 'Bundle', 'entry': [{'resource': r} for r in results]}, 'eob')
+print(f'Retrieved {len(results)} EOB resources')
+return results
+def get_coverage(token: str) -> list[dict]:
+"""
+Query Coverage resources for the authenticated beneficiary.
+Output: list of Coverage resource dicts.
+Note: 400 Bad Request here usually means missing _patient param on some BB2 versions.
+Add params={'beneficiary': 'Patient/bene_id'} if this occurs.
+"""
+data = _get('/Coverage', token)
+_cache(data, 'coverage')
+return [e['resource'] for e in data.get('entry', [])]
+def _cache(data: dict, name: str):
+path = CACHE_DIR / f'{name}.json'
+path.write_text(json.dumps(data, indent=2))
+
+3.5 fhir_response_parser.py
+
+# fhir_response_parser.py
+# Extracts field values from raw FHIR responses into a flat dict
+# matching the FHIRMapper MappingResult schema for comparison.
+def parse_patient(patient: dict) -> dict:
+"""Extract key Patient fields as flat dict."""
+return {
+'bene_id': patient.get('id'),
+'birth_date': patient.get('birthDate'),
+'gender': patient.get('gender'),
+}
+def parse_eob_total(eob_list: list[dict]) -> dict:
+"""
+Aggregate EOB.total.amount.value across all EOBs.
+This approximates total_per_capita_exp from the MSSP PUF.
+Output: {'total_amount': float, 'eob_count': int, 'currency': str}
+"""
+total = 0.0
+currency = None
+for eob in eob_list:
+for item in eob.get('total', []):
+amt = item.get('amount', {})
+total += float(amt.get('value', 0))
+currency = currency or amt.get('currency')
+return {'total_amount': round(total, 2), 'eob_count': len(eob_list), 'currency': currency}
+def parse_coverage(coverage_list: list[dict]) -> dict:
+"""
+Extract Coverage.type.coding.code — maps to enrollment_type in MSSP PUF.
+Expected gap: US Core Coverage.type uses a different value set than MSSP enrollment types.
+Output: {'coverage_type_code': str, 'gap_confirmed': bool}
+"""
+codes = []
+for cov in coverage_list:
+for coding in cov.get('type', {}).get('coding', []):
+codes.append(coding.get('code',''))
+mssp_types = {'ESRD', 'Disabled', 'Aged Dual', 'Aged Non-Dual'}
+found_codes = set(codes)
+gap_confirmed = not bool(found_codes & mssp_types) # True if no MSSP code found
+return {'coverage_type_codes': codes, 'gap_confirmed': gap_confirmed,
+'gap_note': 'US Core Coverage.type codes do not include MSSP enrollment types' if gap_confirmed else ''}
+
+Acceptance criteria — Module 3 is done when
+(1) bb2_sandbox_notebook.ipynb runs from top to bottom without errors after running bb2_auth.get_token(). (2) data/bb2_responses/ contains patient.json, eob.json, and coverage.json. (3) parse_coverage() returns gap_confirmed=True for MSSP enrollment_type (confirming the gap finding). (4) The notebook's final cell shows a comparison table: MSSP PUF column: FHIRMapper expected path
+BB2 actual value: Match?
+
+========================================================================
+Module 4 — CMS Flat-File to FHIR Gap Analysis
+
+Path: modules/puf_fhir_gap_analysis/ | Inputs: Module 2 FHIRMapper + Module 3 BB2 results
+
+Synthesizes FHIRMapper output and BB2 validation results into a structured gap analysis document and policy implications report. This module produces the README-worthy output artifact.
+
+4.1 File tree
+
+modules/puf_fhir_gap_analysis/
+├── gap_analysis.ipynb # synthesis notebook: FHIRMapper + BB2 -> gap table
+├── gap_report_generator.py # renders gap_report.md from gap analysis output
+├── output/
+│ ├── gap_report.md # GitHub-renderable gap analysis table
+│ └── policy_implications.md # one-page prose policy analysis
+└── tests/
+└── test_gap_taxonomy.py
+
+4.2 gap_report_generator.py
+
+# gap_report_generator.py
+import pandas as pd, sys
+sys.path.insert(0, 'modules/fhir_field_mapper')
+from fhir_mapper import FHIRMapper
+GAP_TAXONOMY = {
+None: ('No gap', 'Direct FHIR R4 mapping exists in US Core'),
+'no_equivalent': ('Structural gap', 'No FHIR R4 resource type exists for this concept'),
+'aggregation_gap': ('Aggregation gap', 'Resource exists but population-level aggregation not native to FHIR'),
+'custom_extension_required': ('Extension gap', 'Resource exists but granularity requires CMS-specific extension profile'),
+'partial_mapping': ('Partial mapping', 'Approximate mapping exists with known limitations'),
+}
+def build_gap_table(dataset: str = 'mssp_puf') -> pd.DataFrame:
+"""
+Build a gap analysis DataFrame for all columns in a dataset.
+Input: dataset name string (must exist in FHIRMapper registry).
+Output: DataFrame with columns: column_name, fhir_resource, fhir_element_path,
+cms_0057f_api, gap_category, gap_description, gap_notes.
+"""
+mapper = FHIRMapper()
+rows = []
+for r in mapper.map_all(dataset):
+cat, desc = GAP_TAXONOMY.get(r.gap_type, ('Unknown', ''))
+rows.append({
+'MSSP PUF column': r.column_name,
+'FHIR resource': r.fhir_resource or '— none —',
+'FHIR element path': r.fhir_element_path or '— none —',
+'CMS-0057-F API': r.cms_0057f_api,
+'BB2 validated': r.us_core_validated,
+'Gap category': cat,
+'Gap notes': r.gap_notes,
+})
+return pd.DataFrame(rows)
+def render_gap_report(df: pd.DataFrame, out_path: str = 'modules/puf_fhir_gap_analysis/output/gap_report.md'):
+"""Write gap analysis table to Markdown file."""
+header = '# MSSP PUF to FHIR R4 Gap Analysis\n\n'
+summary = f'**{len(df)} fields analyzed**: **{(df["Gap category"]=="Structural gap").sum()} structural gaps**
+'
+summary += f'**{(df["Gap category"]=="Extension gap").sum()} extension gaps**: '
+summary += f'**{(df["Gap category"]=="No gap").sum()} direct mappings**\n\n'
+md = header + summary + df.to_markdown(index=False)
+open(out_path, 'w').write(md)
+print(f'Gap report written: {out_path}')
+return md
+
+4.3 policy_implications.md — write this by hand
+
+This file is written in prose, not generated by code. It is one page. It must contain three paragraphs addressing: (1) the structural gap finding and its implications for VBC data standardization; (2) the aggregation gap and its implications for ACO analytics infrastructure; (3) what the extension gap means for payers trying to comply with CMS-0057-F using standard FHIR tooling. Do not use bullet points. Write in the voice of a consultant deliverable.
+
+# policy_implications.md — outline for prose content
+## Para 1 — Structural gap (sav_rate, quality_score)
+# Opening: CMS is simultaneously mandating FHIR APIs (CMS-0057-F) and publishing
+# financial performance data (MSSP PUF) in flat-file format that those APIs cannot express.
+# Argument: sav_rate and quality composite score have no FHIR R4 equivalent — not because
+# of implementation choices, but because no standard FHIR resource type exists for
+# population-level financial performance metrics.
+# Implication: as TEFCA matures and FHIR becomes the standard exchange layer, VBC programs
+# will need either (a) new FHIR resource types or (b) CMS-defined extension profiles
+# to carry financial performance data through the API layer.
+## Para 2 — Aggregation gap (per_capita_exp by enrollment_type)
+# Argument: FHIR is inherently patient-level. EOB exists per claim per beneficiary.
+# Population-level aggregation — summing expenditure across a county, stratified by
+# enrollment type — requires a preprocessing layer that FHIR does not natively support.
+# Implication: health IT platforms serving ACO analytics (Arcadia, Inovalon) must build
+# this aggregation layer themselves, which is why the MSSP PUF continues to serve a
+# purpose even as FHIR APIs proliferate.
+## Para 3 — Extension gap (enrollment_type, n_ab_ben)
+# Argument: US Core Coverage.type does not include MSSP enrollment type codes.
+# Capturing ESRD / Disabled / Aged Dual / Aged Non-Dual requires a CMS-specific extension
+# profile that does not yet exist in any published IG.
+# Implication: payers implementing the Patient Access API per CMS-0057-F will be able to
+# expose basic coverage data, but enrollment-type granularity critical for risk adjustment
+# analytics will not flow through the standard FHIR layer without additional standardization work.
+
+4.4 Tests
+
+# tests/test_gap_taxonomy.py
+import sys
+sys.path.insert(0, 'modules/fhir_field_mapper')
+sys.path.insert(0, 'modules/puf_fhir_gap_analysis')
+from gap_report_generator import build_gap_table
+def test_gap_table_has_8_rows():
+df = build_gap_table('mssp_puf')
+assert len(df) == 8, f'Expected 8 rows, got {len(df)}'
+def test_structural_gaps_identified():
+df = build_gap_table('mssp_puf')
+structural = df[df['Gap category'] == 'Structural gap']
+assert 'sav_rate' in structural['MSSP PUF column'].values
+def test_no_gap_for_direct_mapping():
+df = build_gap_table('mssp_puf')
+no_gap = df[df['Gap category'] == 'No gap']
+assert 'avg_risk_score' in no_gap['MSSP PUF column'].values
+def test_report_renders():
+df = build_gap_table('mssp_puf')
+from gap_report_generator import render_gap_report
+md = render_gap_report(df, '/tmp/test_gap_report.md')
+assert '# MSSP PUF to FHIR R4 Gap Analysis' in md
+assert 'sav_rate' in md
+
+Acceptance criteria — Module 4 is done when
+(1) build_gap_table('mssp_puf') returns a DataFrame with 8 rows. (2) output/gap_report.md renders correctly in GitHub as a Markdown table with the summary line. (3) output/policy_implications.md is 3 paragraphs, no bullet points. (4) pytest passes all 4 tests. (5) gap_analysis.ipynb imports from both fhir_mapper.py (Module 2) and bb2_responses/ cache (Module 3) and runs without errors.
+
+========================================================================
+End-to-end validation — run after all 4 modules
+
+# Run from repo root after all modules are built
+# 1. Module 1
+cd modules/pa_compliance_checker && python run_all.py
+# Expected: output/compliance_report.md created with 4+ payers
+pytest tests/ -v
+# Expected: 4 tests pass
+# 2. Module 2
+cd ../fhir_field_mapper
+python -c "from fhir_mapper import FHIRMapper; m=FHIRMapper(); print(m.summary())"
+# Expected: {'no_gap': 2, 'custom_extension_required': 3, 'no_equivalent': 1, 'aggregation_gap': 1, 'partial_mapping': 1}
+pytest tests/ -v
+# 3. Module 3
+# Run bb2_sandbox_notebook.ipynb top-to-bottom
+# Expected: data/bb2_responses/ has patient.json, eob.json, coverage.json
+# Expected: coverage parse shows gap_confirmed=True
+# 4. Module 4
+cd ../puf_fhir_gap_analysis
+python -c "from gap_report_generator import build_gap_table,render_gap_report; render_gap_report(build_gap_table())"
+# Expected: output/gap_report.md created
+pytest tests/ -v
+# 5. Full repo test sweep
+cd ../../ && pytest modules/ -v --tb=short
+# Expected: all tests pass
+
+Generated by Claude | April 2026 | fhir-cms-interop-toolkit v2 — Claude Code-executable technical specs. Companion to CORPUZ-2024 MSSP cost_risk_score_agg_dashb.
