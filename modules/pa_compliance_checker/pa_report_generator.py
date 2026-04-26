@@ -1,5 +1,6 @@
 # pa_report_generator.py
 import pandas as pd
+from pathlib import Path
 from pa_compliance_validator import ValidationResult
 
 STATUS_EMOJI = {'PASS': 'OK', 'FAIL': 'FAIL', 'WARN': 'WARN', 'MISSING': 'MISS'}
@@ -13,6 +14,6 @@ def to_markdown_table(results: list[ValidationResult]) -> str:
 
 def save_report(results: list[ValidationResult], out_path: str = 'output/compliance_report.md'):
     md = '# CMS-0057-F PA Metrics Compliance Report\n\n' + to_markdown_table(results)
-    with open(out_path, 'w') as f:
-        f.write(md)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(md, encoding='utf-8')
     print(f'Report saved: {out_path}')

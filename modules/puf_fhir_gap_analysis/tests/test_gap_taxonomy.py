@@ -4,7 +4,7 @@ import os
 
 # Add relevant directories to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'modules', 'fhir_field_mapper')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'fhir_field_mapper')))
 
 from gap_report_generator import build_gap_table, render_gap_report
 

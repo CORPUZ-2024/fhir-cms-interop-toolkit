@@ -3,11 +3,13 @@ import requests, os, time
 from pathlib import Path
 
 PAYERS = {
-    'molina_ca': 'https://www.molinahealthcare.com/providers/ca/medicaid/prior-auth/metrics',
-    'lacare': 'https://www.lacare.org/providers/prior-authorization/metrics',
-    'caloptima': 'https://www.caloptima.org/prior-auth-metrics',
-    'bsca': 'https://www.blueshieldca.com/providers/prior-auth-metrics',
+    'blue_shield_ca': 'https://www.blueshieldca.com/providers/prior-auth-metrics',
+    'healthnet': 'https://www.healthnet.com/portal/provider/content/prior-authorization/metrics.html',
+    'sfph': 'https://www.sfhp.org/providers/prior-authorization/metrics',
+    'wellcare_healthnet': 'https://www.wellcare.com/prior-authorization-metrics',
 }
+# NOTE: All 4 PDFs were manually obtained (March 2026 disclosures) and are pre-placed
+# in data/payer_disclosures/. fetch_all() skips any payer whose file already exists.
 
 SAVE_DIR = Path('modules/pa_compliance_checker/data/payer_disclosures')
 

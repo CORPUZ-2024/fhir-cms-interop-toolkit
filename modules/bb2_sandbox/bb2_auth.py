@@ -8,8 +8,8 @@ from pathlib import Path
 
 load_dotenv()
 
-CLIENT_ID = os.environ.get('BB2_CLIENT_ID', 'your_id_here')
-CLIENT_SECRET = os.environ.get('BB2_CLIENT_SECRET', 'your_secret_here')
+CLIENT_ID = os.environ['BB2_CLIENT_ID']
+CLIENT_SECRET = os.environ['BB2_CLIENT_SECRET']
 CALLBACK_URL = os.environ.get('BB2_CALLBACK_URL', 'http://localhost:8000/callback')
 
 AUTH_URL = 'https://sandbox.bluebutton.cms.gov/o/authorize/'

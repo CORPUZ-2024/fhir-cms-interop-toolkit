@@ -57,5 +57,6 @@ def get_coverage(token: str) -> list[dict]:
     return [e['resource'] for e in data.get('entry', [])]
 
 def _cache(data: dict, name: str):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / f'{name}.json'
     path.write_text(json.dumps(data, indent=2))
